@@ -1,0 +1,192 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>NspdRepack</AssemblyName>
+    <RootNamespace>NspdRepack</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <LangVersion>7.3</LangVersion>
+    <Version>2.1.0</Version>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <Deterministic>true</Deterministic>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <GenerateSupportedRuntime>false</GenerateSupportedRuntime>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Tools\**" />
+    <EmbeddedResource Remove="Tools\**" />
+    <None Remove="Tools\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+
+  <UsingTask TaskName="AppendPayload" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <ExePath ParameterType="System.String" Required="true" />
+      <HacpackPath ParameterType="System.String" />
+      <HactoolPath ParameterType="System.String" />
+      <KeysPath ParameterType="System.String" />
+      <RomfsDir ParameterType="System.String" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.Text" />
+      <Using Namespace="System.Text.RegularExpressions" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        byte[] magic = Encoding.ASCII.GetBytes("NSPDPAY1");
+        const int FooterSize = 32;
+
+        var files = new List<KeyValuePair<string, string>>();   
+        var dirs = new List<string>();
+
+        if (!string.IsNullOrEmpty(HacpackPath) && File.Exists(HacpackPath)) files.Add(new KeyValuePair<string, string>("hacpack.exe", HacpackPath));
+        if (!string.IsNullOrEmpty(HactoolPath) && File.Exists(HactoolPath)) files.Add(new KeyValuePair<string, string>("hactool.exe", HactoolPath));
+        string tmpKeys = null;
+        if (!string.IsNullOrEmpty(KeysPath) && File.Exists(KeysPath))
+        {
+            var unused = new Regex(
+                @"^\s*(bis_kek_source|bis_key_0[0-3]|bis_key_source_0[0-2]|device_key_4x" +
+                @"|eticket_rsa_(kek|kek_personalized|kek_source|kekek_source|keypair)" +
+                @"|mariko_master_kek_source_(0[5-9a-f]|1[0-5])|per_console_key_source" +
+                @"|retail_specific_aes_key_source|save_mac_(key|sd_card_kek_source|sd_card_key_source)" +
+                @"|sd_card_custom_storage_key_source|sd_seed" +
+                @"|ssl_rsa_(kek|kek_personalized|kek_source|kekek_source|key))\s*=", RegexOptions.IgnoreCase);
+            tmpKeys = Path.Combine(Path.GetTempPath(), "nspd_keys_" + Guid.NewGuid().ToString("N") + ".keys");
+            using (var kr = new StreamReader(KeysPath))
+            using (var kw = new StreamWriter(tmpKeys, false, new UTF8Encoding(false)))
+            {
+                string kl;
+                while ((kl = kr.ReadLine()) != null)
+                    if (!unused.IsMatch(kl)) kw.WriteLine(kl);
+            }
+            files.Add(new KeyValuePair<string, string>("prod.keys", tmpKeys));
+        }
+
+        int romfsFiles = 0;
+        if (!string.IsNullOrEmpty(RomfsDir) && Directory.Exists(RomfsDir))
+        {
+            string root = Path.GetFullPath(RomfsDir).TrimEnd('\\', '/');
+            dirs.Add("romfs_base");
+            foreach (string d in Directory.GetDirectories(root, "*", SearchOption.AllDirectories))
+                dirs.Add("romfs_base/" + d.Substring(root.Length + 1).Replace('\\', '/'));
+            foreach (string f in Directory.GetFiles(root, "*", SearchOption.AllDirectories))
+            {
+                files.Add(new KeyValuePair<string, string>("romfs_base/" + f.Substring(root.Length + 1).Replace('\\', '/'), f));
+                romfsFiles++;
+            }
+        }
+
+        dirs.Sort(StringComparer.Ordinal);
+        files.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+
+        using (var fs = new FileStream(ExePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None, 1 << 20))
+        {
+            // cut off a payload that is already there, so building twice never stacks them
+            long start = fs.Length;
+            if (fs.Length >= FooterSize)
+            {
+                fs.Seek(-FooterSize, SeekOrigin.End);
+                byte[] tail = new byte[FooterSize];
+                int got = 0;
+                while (got < FooterSize)
+                {
+                    int n0 = fs.Read(tail, got, FooterSize - got);
+                    if (n0 <= 0) break;
+                    got += n0;
+                }
+                bool found = got == FooterSize;
+                for (int i = 0; found && i < 8; i++)
+                    if (tail[i] != magic[i]) found = false;
+                if (found)
+                {
+                    long old = BitConverter.ToInt64(tail, 8);
+                    if (old > 0 && old <= fs.Length - FooterSize) start = old;
+                }
+            }
+            fs.SetLength(start);
+            fs.Seek(start, SeekOrigin.Begin);
+
+            var names = new List<string>();
+            var offsets = new List<long>();
+            var sizes = new List<long>();
+            foreach (string d in dirs) { names.Add(d); offsets.Add(0L); sizes.Add(-1L); }
+
+            byte[] buf = new byte[1 << 20];
+            long total = 0;
+            foreach (var kv in files)
+            {
+                long off = fs.Position;
+                long len = 0;
+                using (var src = new FileStream(kv.Value, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 20))
+                {
+                    int n;
+                    while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        fs.Write(buf, 0, n);
+                        len += n;
+                    }
+                }
+                names.Add(kv.Key);
+                offsets.Add(off);
+                sizes.Add(len);
+                total += len;
+            }
+
+            long indexOffset = fs.Position;
+            var bw = new BinaryWriter(fs, Encoding.UTF8, true);
+            for (int i = 0; i < names.Count; i++)
+            {
+                bw.Write(names[i]);
+                bw.Write(offsets[i]);
+                bw.Write(sizes[i]);
+            }
+            bw.Write(magic);
+            bw.Write(start);
+            bw.Write(indexOffset);
+            bw.Write(names.Count);
+            bw.Write(0);
+            bw.Flush();
+
+            Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+                "NspdRepack: bundled {0} file(s) ({1:N0} bytes) into {2}, {3} of them from romfs_base",
+                files.Count, total, Path.GetFileName(ExePath), romfsFiles);
+        }
+        if (tmpKeys != null) { try { File.Delete(tmpKeys); } catch { } }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="BundlePayload" AfterTargets="Build" Condition="'$(BundlePayload)' != 'false'">
+    <ItemGroup>
+      <_HacpackFound Include="Tools\**\hacpack.exe" Exclude="Tools\romfs_base\**" />
+      <_HactoolFound Include="Tools\**\hactool.exe" Exclude="Tools\romfs_base\**" />
+      <_KeysFound Include="Tools\**\prod.keys" Exclude="Tools\romfs_base\**" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_HacpackSrc>%(_HacpackFound.FullPath)</_HacpackSrc>
+      <_HactoolSrc>%(_HactoolFound.FullPath)</_HactoolSrc>
+      <_KeysSrc>%(_KeysFound.FullPath)</_KeysSrc>
+      <_RomfsSrc Condition="'$(BundleRomfs)' != 'false' And Exists('Tools\romfs_base')">$(MSBuildProjectDirectory)\Tools\romfs_base</_RomfsSrc>
+    </PropertyGroup>
+    <Warning Condition="'$(_HacpackSrc)' == ''" Text="Tools\**\hacpack.exe not found - hacpack will NOT be bundled into the exe." />
+    <Warning Condition="'$(_KeysSrc)' == ''" Text="Tools\**\prod.keys not found - prod.keys will NOT be bundled into the exe." />
+    <Warning Condition="'$(_RomfsSrc)' == '' And '$(BundleRomfs)' != 'false'" Text="Tools\romfs_base not found - the base RomFS will NOT be bundled into the exe." />
+    <Message Condition="'$(_HactoolSrc)' == ''" Importance="high" Text="Tools\**\hactool.exe not found - building without it (hactool checks will be skipped at run time)." />
+    <AppendPayload ExePath="$(TargetPath)" HacpackPath="$(_HacpackSrc)" HactoolPath="$(_HactoolSrc)" KeysPath="$(_KeysSrc)" RomfsDir="$(_RomfsSrc)" />
+  </Target>
+
+  <Target Name="RemoveExeConfig" AfterTargets="Build">
+    <Delete Files="$(OutDir)$(TargetFileName).config" />
+  </Target>
+
+</Project>
